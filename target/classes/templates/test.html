@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>WebSocket Debug UI</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #1e1e1e;
+            color: #eee;
+            padding: 20px;
+        }
+        button {
+            margin: 5px;
+            padding: 10px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        #status {
+            margin-bottom: 10px;
+            font-weight: bold;
+        }
+        .log-container {
+        display: flex;
+        flex-direction: column; /* ← ключевой параметр */
+        gap: 20px;
+        margin-top: 20px;
+        }
+
+        .log-panel {
+            flex: 1;
+            background: #111;
+            color: #0f0;
+            padding: 10px;
+            height: 300px;
+            overflow-y: scroll;
+            border: 1px solid #444;
+            white-space: pre-wrap;
+        }
+        .log-title {
+            margin-top: 0;
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+
+<h2>🧠 WebSocket Debug UI</h2>
+<div id="status">⏳ Ожидание подключения...</div>
+
+<!-- Кнопки -->
+<div>
+    <button onclick="sendDirection()">🚶‍♂️ Сделать шаг</button>
+    <button onclick="sendInit()">🚀 Инициализировать игрока</button>
+    <button onclick="clearLogs()">🧹 Очистить логи</button>
+</div>
+
+<button id="sellButton">Продать всё</button>
+
+
+
+<!-- Поля для ввода координат атаки -->
+<div>
+    <label for="attackX">X цели:</label>
+    <input type="number" id="attackX" value="1" style="width:60px;">
+    <label for="attackY">Y цели:</label>
+    <input type="number" id="attackY" value="0" style="width:60px;">
+    <button onclick="sendAttack()">🔫 Атаковать</button>
+</div>
+
+<!-- Выбор направления -->
+<div>
+    <label for="stepDirection">Направление:</label>
+    <select id="stepDirection">
+        <option value="U">⬆️ Вверх</option>
+        <option value="D">⬇️ Вниз</option>
+        <option value="L">⬅️ Влево</option>
+        <option value="R">➡️ Вправо</option>
+    </select>
+</div>
+
+<!-- Логи -->
+<div class="log-container">
+    <div>
+        <h3>📜 Основные логи</h3>
+        <pre id="wsLog" class="log-panel"></pre>
+    </div>
+    <div>
+        <h3>👁️ Логи видимости</h3>
+        <pre id="wsvisLog" class="log-panel"></pre>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+
+
+<script>
+    let stompClient;
+    let reconnectAttempts = 0;
+    const maxReconnectAttempts = 5;
+    let userName = null;
+
+
+    const player = {
+        updateName: name => logWS('CLIENT', 'PLAYER', { action: 'updateName', name }),
+        handleServerPosition: pos => logWS('CLIENT', 'PLAYER', { action: 'handleServerPosition', pos })
+    };
+    const otherPlayersManager = {
+        updateVisibility: players => logWSVIS('CLIENT', 'VISIBILITY', { action: 'updateVisibility', players }),
+        removePlayer: id => logWS('CLIENT', 'DISCONNECT', { action: 'removePlayer', id })
+    };
+    const combatSystem = {
+        handleCombatEvent: data => logWS('CLIENT', 'COMBAT', { action: 'handleCombatEvent', data })
+    };
+
+    const inventoryManager = {
+        updateAfterSale(soldItemIds, goldReceived) {
+            // 🔄 Удаляем проданные предметы из локального инвентаря
+            soldItemIds.forEach(id => {
+                const index = playerInventory.findIndex(item => item.itemId === id);
+                if (index !== -1) {
+                    console.log(`🧹 Удаляем предмет ID=${id} из инвентаря`);
+                    playerInventory.splice(index, 1);
+                }
+            });
+
+            // 💰 Обновляем баланс
+            playerGold += goldReceived;
+            console.log(`💰 Новый баланс: ${playerGold}`);
+
+            // 🖼️ Обновляем UI
+            renderInventory(playerInventory);
+            updateGoldDisplay(playerGold);
+
+            // 🔔 Визуальный фидбэк
+            showToast(`Вы продали ${soldItemIds.length} предметов и получили ${goldReceived} монет`);
+        }
+    };
+    document.getElementById('sellButton').addEventListener('click', () => {
+        try {
+            stompClient.send('/app/inventory/sell', {}, {});
+            logWS('WS-OUT', 'SellCommand', {});
+        } catch (e) {
+            console.error('❌ Ошибка отправки команды продажи:', e);
+        }
+    });
+
+
+    function logWS(type, tag, data) {
+        const logArea = document.getElementById('wsLog');
+        const timestamp = new Date().toLocaleTimeString();
+        const entry = `[${timestamp}] [${type}] [${tag}] ${JSON.stringify(data, null, 2)}\n`;
+        logArea.textContent += entry;
+        logArea.scrollTop = logArea.scrollHeight;
+    }
+
+    function logWSVIS(type, tag, data) {
+        const logArea = document.getElementById('wsvisLog');
+        const timestamp = new Date().toLocaleTimeString();
+        const entry = `[${timestamp}] [${type}] [${tag}] ${JSON.stringify(data, null, 2)}\n`;
+        logArea.textContent += entry;
+        logArea.scrollTop = logArea.scrollHeight;
+    }
+
+    function updateStatus(text, isError = false) {
+        const statusDiv = document.getElementById('status');
+        statusDiv.textContent = text;
+        statusDiv.style.color = isError ? 'red' : 'lime';
+    }
+
+    function clearLogs() {
+        document.getElementById('wsLog').textContent = '';
+        document.getElementById('wsvisLog').textContent = '';
+    }
+
+    function initWebSocket() {
+        updateStatus('🔌 Подключение к серверу...');
+        const socket = new WebSocket("ws://localhost:8080/ws-game");
+
+        socket.onerror = e => {
+            console.error(e);
+            updateStatus('❌ Ошибка подключения', true);
+            logWS('CLIENT', 'ERROR', e);
+        };
+
+        socket.onclose = e => {
+            if (reconnectAttempts < maxReconnectAttempts) {
+                reconnectAttempts++;
+                const delay = Math.min(3000 * reconnectAttempts, 10000);
+                updateStatus(`🔄 Переподключение через ${delay / 1000} сек... (${reconnectAttempts}/${maxReconnectAttempts})`);
+                setTimeout(initWebSocket, delay);
+            } else {
+                updateStatus('🚫 Не удалось подключиться', true);
+            }
+        };
+
+        stompClient = Stomp.over(socket);
+        stompClient.debug = null;
+
+        stompClient.connect({}, frame => {
+            reconnectAttempts = 0;
+            userName = frame.headers['user-name'];
+            updateStatus('✅ Подключено: ' + userName);
+            if (userName && player) player.updateName(userName);
+
+            stompClient.subscribe(`/user/${userName}/queue/events`, msg => {
+                try {
+                    const pos = JSON.parse(msg.body);
+                    logWS('WS-IN', 'Position', pos);
+                    if (player) player.handleServerPosition(pos);
+                } catch (e) {
+                    console.error(e);
+                }
+            });
+
+            stompClient.subscribe(`/user/${userName}/queue/visibility`, msg => {
+                try {
+                    const visibilityData = JSON.parse(msg.body);
+                    logWSVIS('WS-IN', 'Visibility', visibilityData);
+                    if (otherPlayersManager && visibilityData.visiblePlayers)
+                        otherPlayersManager.updateVisibility(visibilityData.visiblePlayers);
+                } catch (e) {
+                    console.error(e);
+                }
+            });
+
+            stompClient.subscribe(`/user/${userName}/queue/environment`, msg => {
+                try {
+                    const environmentData = JSON.parse(msg.body);
+                    logWSVIS('WS-IN', 'Environment', environmentData);
+
+                } catch (e) {
+                    console.error(e);
+                }
+            });
+
+
+            stompClient.subscribe(`/user/${userName}/queue/combat`, msg => {
+                try {
+                    const combatData = JSON.parse(msg.body);
+
+                    // Логируем весь combatData как есть
+                    logWS('WS-IN', 'Combat', { raw: combatData });
+
+                    if (combatSystem) {
+                        combatSystem.handleCombatEvent(combatData);
+
+                        logWS('CLIENT', 'CombatHandled', {
+                            status: 'OK',
+                            eventType: combatData?.targetName ? 'success' : 'miss',
+                            fullPayload: combatData // сохраняем всё, что пришло
+                        });
+                    }
+                } catch (e) {
+                    console.error('[Combat][ERROR]', { error: e, raw: msg.body });
+                }
+            });
+
+            stompClient.subscribe(`/user/${userName}/queue/loot`, msg => {
+                try {
+                    const lootData = JSON.parse(msg.body);
+
+                    // Логируем весь lootData как есть
+                    logWS('WS-IN', 'Loot', { raw: lootData });
+
+                    if (lootSystem) {
+                        lootSystem.handleLootEvent(lootData);
+
+                        logWS('CLIENT', 'LootHandled', {
+                            status: 'OK',
+                            source: lootData?.sourceObjectName ?? 'unknown',
+                            items: lootData?.itemNames ?? [],
+                            fullPayload: lootData
+                        });
+                    }
+                } catch (e) {
+                    console.error('[Loot][ERROR]', { error: e, raw: msg.body });
+                }
+            });
+
+
+
+            stompClient.subscribe('/topic/player/disconnect', msg => {
+                try {
+                    const data = JSON.parse(msg.body);
+                    logWS('WS-IN', 'Disconnect', data);
+                    if (data.type === 'playerDisconnect' && data.playerId)
+                        otherPlayersManager.removePlayer(data.playerId);
+                } catch (e) {
+                    console.error(e);
+                }
+            });
+
+            stompClient.subscribe(`/user/${userName}/topic/inventory/sellResult`, msg => {
+                try {
+                    console.log("📨 Получено от сервера (sellResult):", msg.body);
+                    logWS('WS-IN', 'SellResult', msg.body);
+                } catch (e) {
+                    console.error('❌ Ошибка обработки sellResult:', e);
+                }
+            });
+
+
+
+        }, err => {
+            console.error(err);
+            updateStatus('❌ Ошибка подключения', true);
+        });
+    }
+
+    function sendAttack() {
+        const x = parseInt(document.getElementById('attackX').value, 10);
+        const y = parseInt(document.getElementById('attackY').value, 10);
+
+        if (isNaN(x) || isNaN(y)) {
+            logWS('CLIENT', 'ERROR', 'Некорректные координаты атаки');
+            return;
+        }
+
+        const dto = { targetX: x, targetY: y };
+        stompClient.send("/app/player/attack", {}, JSON.stringify(dto));
+        logWS('WS-OUT', 'Attack', dto);
+    }
+
+    function sendDirection() {
+        const direction = document.getElementById('stepDirection').value;
+        if (!direction || !["U", "D", "L", "R"].includes(direction)) {
+            logWS('CLIENT', 'ERROR', 'Некорректное направление');
+            return;
+        }
+        if (!userName) {
+            logWS('CLIENT', 'ERROR', 'Имя пользователя не определено');
+            return;
+        }
+        const payload = { direction };
+        stompClient.send("/app/player/move", {}, JSON.stringify(payload));
+        logWS('WS-OUT', 'MoveCommand', payload);
+    }
+
+    function sendInit() {
+        stompClient.send("/app/player/init", {}, "");
+        logWS('WS-OUT', 'Init', { command: 'initPlayer' });
+    }
+
+    initWebSocket();
+</script>
+
+</body>
+</html>

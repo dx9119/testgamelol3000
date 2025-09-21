@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>Phaser WebSocket Game Client</title>
+    <style>
+        html,body{height:100%;margin:0;background:#0b0b0b;}
+        body{overflow:hidden;-webkit-user-select:none;user-select:none;}
+        canvas{display:block;}
+        #info{
+            position:fixed;left:8px;bottom:8px;color:#9f9;
+            padding:8px;background:rgba(0,0,0,0.35);
+            font:13px monospace;border-radius:6px;z-index:999
+        }
+        #status{
+            position:fixed;right:8px;top:8px;color:#9f9;
+            padding:8px;background:rgba(0,0,0,0.35);
+            font:13px monospace;border-radius:6px;z-index:999
+        }
+        #combat-log {
+            position: fixed;
+            left: 8px;
+            top: 8px;
+            color: #ff6b6b;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 8px;
+            font: 13px monospace;
+            border-radius: 6px;
+            z-index: 998;
+            max-width: 300px;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+        #attack-menu {
+            position: fixed;
+            background: rgba(0, 0, 0, 0.8);
+            border: 2px solid #ff4444;
+            border-radius: 8px;
+            padding: 10px;
+            z-index: 1000;
+            display: none;
+        }
+        .attack-option {
+            color: white;
+            padding: 8px 12px;
+            margin: 4px 0;
+            cursor: pointer;
+            border-radius: 4px;
+            background: rgba(255, 68, 68, 0.3);
+        }
+        .attack-option:hover {
+            background: rgba(255, 68, 68, 0.6);
+        }
+
+        /* Отключение контекстного меню */
+        body {
+            -webkit-touch-callout: none;
+            -webkit-user-select: none;
+            -khtml-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+        }
+    </style>
+</head>
+<body oncontextmenu="return false;">
+<div id="info">ЛКМ — задать цель. Удерживайте ПКМ для атаки. Стрелки — пошаговое управление.</div>
+<div id="status">Подключение...</div>
+<div id="combat-log"></div>
+<div id="attack-menu">
+    <div class="attack-option" onclick="attackSelectedTarget()">⚔️ Атаковать</div>
+    <div class="attack-option" onclick="hideAttackMenu()">❌ Отмена</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/phaser@3/dist/phaser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+<script>
+    /* ===== Константы ===== */
+    const CELL_SIZE = 56;
+    const LOAD_EXTRA = 12;
+    const TWEEN_MS = 160;
+
+    let attackTarget = null;
+    let attackMenuVisible = false;
+
+    /* ===== WorldManager ===== */
+    class WorldManager {
+        constructor(scene) {
+            this.scene = scene;
+            this.cells = new Map();
+        }
+        key(x,y){return `${x},${y}`;}
+
+        ensureCoveringCamera(cam){
+            const left = cam.scrollX, top = cam.scrollY;
+            const right = left + cam.width/cam.zoom;
+            const bottom = top + cam.height/cam.zoom;
+            const extra = LOAD_EXTRA;
+            const minX = Math.floor(left/CELL_SIZE)-extra;
+            const maxX = Math.floor(right/CELL_SIZE)+extra;
+            const minY = Math.floor(top/CELL_SIZE)-extra;
+            const maxY = Math.floor(bottom/CELL_SIZE)+extra;
+
+            const newMap = new Map();
+            for(let x=minX;x<=maxX;x++){
+                for(let y=minY;y<=maxY;y++){
+                    const k=this.key(x,y);
+                    if(this.cells.has(k)) newMap.set(k,this.cells.get(k));
+                    else newMap.set(k,this._createCell(x,y));
+                }
+            }
+            for(const [k,v] of this.cells.entries()) if(!newMap.has(k)) v.rect.destroy();
+            this.cells=newMap;
+        }
+
+        _createCell(x,y){
+            const color=((x+y)&1)?0xeef3e8:0xf7f7f1;
+            const px=x*CELL_SIZE, py=y*CELL_SIZE;
+            const rect=this.scene.add.rectangle(px,py,CELL_SIZE,CELL_SIZE,color).setOrigin(0,0);
+            rect.setStrokeStyle(1,0xcfcfcf,0.55).setDepth(0).setScrollFactor(1);
+            return {rect,revealed:false};
+        }
+    }
+
+    /* ===== Player ===== */
+    class Player {
+        constructor(scene, world, id, name) {
+            this.scene = scene;
+            this.world = world;
+            this.id = id;
+            this.name = name || 'Игрок';
+            this.x = 0;
+            this.y = 0;
+            this.target = null;
+            this.isMoving = false;
+            this.pendingMoves = [];
+            this.health = 100;
+            this.maxHealth = 100;
+            this.speed = 1;
+            this.vision = 1;
+
+            this.lastMoveTime = 0;
+            this.moveInterval = 200;
+
+            const r = Math.max(6, CELL_SIZE / 2 - 8);
+            this.shadow = scene.add.circle(0, 0, r + 4, 0x000000, 0.14).setDepth(300);
+            this.sprite = scene.add.circle(0, 0, r, 0xffffff).setDepth(400);
+            this.sprite.setStrokeStyle(2, 0x4aa3ff);
+
+            // Полоса здоровья с текстом
+            this.healthBarBg = scene.add.rectangle(0, 0, CELL_SIZE * 0.8, 8, 0x333333)
+                .setDepth(404).setOrigin(0.5);
+            this.healthBar = scene.add.rectangle(0, 0, CELL_SIZE * 0.8, 8, 0x00ff00)
+                .setDepth(405).setOrigin(0.5, 0.5);
+            this.hpText = scene.add.text(0, 0, `${this.health}/${this.maxHealth}`, {
+                fontSize: '10px',
+                color: '#ffffff',
+                fontStyle: 'bold',
+                stroke: '#000000',
+                strokeThickness: 2
+            }).setDepth(406).setOrigin(0.5);
+
+            this.nameLabel = scene.add.text(0, 0, this.name, {
+                fontSize: '12px',
+                color: '#ffffff',
+                fontStyle: 'bold',
+                stroke: '#000000',
+                strokeThickness: 2,
+                backgroundColor: 'rgba(0,0,0,0.4)',
+                padding: { x: 4, y: 2 }
+            }).setDepth(410).setOrigin(0.5);
+
+
+            this.attackIndicator = scene.add.circle(0, 0, r * 1.5, 0xff0000, 0.3)
+                .setDepth(399).setVisible(false);
+
+            // ======== Добавляем маркер цели ========
+            this.marker = scene.add.circle(0, 0, CELL_SIZE * 0.3, 0xff6666, 0.5)
+                .setDepth(350)
+                .setVisible(false);
+
+            this.placeAt(this.x, this.y, true);
+            this.updateHealthBar();
+        }
+
+        updateHealthBar() {
+            const healthPercent = this.health / this.maxHealth;
+            this.healthBar.setScale(healthPercent, 1);
+            this.healthBar.setFillStyle(healthPercent > 0.5 ? 0x00ff00 :
+                healthPercent > 0.25 ? 0xffa500 : 0xff0000);
+
+            // Обновление текста HP
+            this.hpText.setText(`${Math.max(0, Math.floor(this.health))}/${this.maxHealth}`);
+        }
+
+        takeDamage(damage, remainingHP) {
+            this.health = Math.max(0, remainingHP);
+            this.updateHealthBar();
+            this.scene.tweens.add({ targets: this.sprite, tint: 0xff0000, duration: 200, yoyo: true, repeat: 1 });
+            this.attackIndicator.setVisible(true);
+            this.scene.tweens.add({
+                targets: this.attackIndicator,
+                alpha: 0,
+                duration: 1000,
+                onComplete: () => {
+                    this.attackIndicator.setVisible(false);
+                    this.attackIndicator.setAlpha(0.3);
+                }
+            });
+        }
+
+        showAttackIndicator() { this.attackIndicator.setVisible(true); }
+        hideAttackIndicator() { this.attackIndicator.setVisible(false); }
+        updateName(newName) { if (newName) this.nameLabel.setText(newName); }
+
+        serverMove(direction) {
+            if (this.isMoving) { this.pendingMoves.push(direction); return; }
+            this.isMoving = true;
+            if (stompClient && stompClient.connected) {
+                stompClient.send("/app/player/move", {}, JSON.stringify({ direction }));
+            } else { this.isMoving = false; }
+        }
+
+        handleServerPosition(positionDTO) {
+            this.placeAt(positionDTO.x, positionDTO.y, false);
+            this.isMoving = positionDTO.isMoving;
+            if (positionDTO.hp !== undefined) { this.health = positionDTO.hp; this.updateHealthBar(); }
+            if (positionDTO.speed !== undefined) this.speed = positionDTO.speed;
+            if (positionDTO.vision !== undefined) this.vision = positionDTO.vision;
+            if (this.pendingMoves.length > 0) this.serverMove(this.pendingMoves.shift());
+        }
+
+        placeAt(nx, ny, immediate = false) {
+            this.x = nx; this.y = ny;
+            const centerX = nx * CELL_SIZE + CELL_SIZE / 2;
+            const centerY = ny * CELL_SIZE + CELL_SIZE / 2;
+            const nameY = centerY - CELL_SIZE * 0.7;
+            const healthY = centerY - CELL_SIZE * 0.5;
+
+            const visuals = [
+                { obj: this.sprite, x: centerX, y: centerY },
+                { obj: this.shadow, x: centerX, y: centerY },
+                { obj: this.attackIndicator, x: centerX, y: centerY },
+                { obj: this.nameLabel, x: centerX, y: nameY },
+                { obj: this.healthBarBg, x: centerX, y: healthY },
+                { obj: this.healthBar, x: centerX, y: healthY },
+                { obj: this.hpText, x: centerX, y: healthY }
+            ];
+
+            if (immediate) {
+                visuals.forEach(({ obj, x, y }) => {
+                    if (obj) setPosition(obj, x, y);
+                });
+            } else {
+                visuals.forEach(({ obj, x, y }) => {
+                    if (obj) {
+                        this.scene.tweens.add({ targets: obj, x: x, y: y, duration: TWEEN_MS });
+                    }
+                });
+            }
+        }
+
+        updateUIPosition() {
+            // Устаревший метод, больше не используется для анимации UI
+        }
+
+        setTarget(tx, ty) {
+            this.target = { x: tx, y: ty };
+            this.marker.setPosition(tx * CELL_SIZE + CELL_SIZE / 2, ty * CELL_SIZE + CELL_SIZE / 2);
+            this.marker.visible = true;
+            stompClient.send("/app/player/target", {}, JSON.stringify({ targetX: tx, targetY: ty }));
+        }
+
+        clearTarget() {
+            this.target = null;
+            if (this.marker) this.marker.visible = false;
+            this.pendingMoves = [];
+        }
+
+        tryStep() {
+            if (!this.target || this.isMoving) return;
+            if (this.x === this.target.x && this.y === this.target.y) { this.clearTarget(); return; }
+            const now = Date.now();
+            if (now - this.lastMoveTime < this.moveInterval) return;
+            const dx = this.target.x - this.x;
+            const dy = this.target.y - this.y;
+            const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'R' : 'L') : (dy > 0 ? 'D' : 'U');
+            this.lastMoveTime = now;
+            this.serverMove(dir);
+        }
+    }
+
+    /* ===== OtherPlayersManager ===== */
+    class OtherPlayersManager {
+        constructor(scene, world) {
+            this.scene = scene;
+            this.world = world;
+            this.players = new Map();
+        }
+
+        addPlayer(id, x, y, name) {
+            if (this.players.has(id)) return;
+            const p = new Player(this.scene, this.world, id, name || `Игрок ${id}`);
+            p.placeAt(x, y, true);
+            p.sprite.setFillStyle(0xaaa);
+            this.players.set(id, p);
+        }
+
+        updateVisibility(visiblePlayersData) {
+            const visibleIds = new Set();
+            visiblePlayersData.forEach(playerData => {
+                visibleIds.add(playerData.id);
+                let p = this.players.get(playerData.id);
+                if (p) {
+                    p.placeAt(playerData.x, playerData.y, false);
+                    p.isMoving = playerData.isMoving;
+                    if(playerData.hp!==undefined){p.health=playerData.hp;p.updateHealthBar();}
+                    if(playerData.speed!==undefined)p.speed=playerData.speed;
+                    if(playerData.vision!==undefined)p.vision=playerData.vision;
+                    p.updateName(playerData.name);
+                } else {
+                    this.addPlayer(playerData.id, playerData.x, playerData.y, playerData.name);
+                    p = this.players.get(playerData.id);
+                    if(playerData.hp!==undefined){p.health=playerData.hp;p.updateHealthBar();}
+                    if(playerData.speed!==undefined)p.speed=playerData.speed;
+                    if(playerData.vision!==undefined)p.vision=playerData.vision;
+                }
+            });
+            for(const [id, player] of this.players.entries()){
+                if(!visibleIds.has(id)) this.removePlayer(id);
+            }
+        }
+
+        removePlayer(id) {
+            const p = this.players.get(id);
+            if (!p) return;
+            this.scene.tweens.add({
+                targets: [p.sprite,p.shadow,p.nameLabel,p.marker,p.healthBar,p.healthBarBg,p.hpText,p.attackIndicator],
+                alpha:0,duration:500,onComplete:()=>{
+                    [p.sprite,p.shadow,p.nameLabel,p.marker,p.healthBar,p.healthBarBg,p.hpText,p.attackIndicator].forEach(o=>{if(o)o.destroy();});
+                    this.players.delete(id);
+                }
+            });
+        }
+
+        getPlayerById(id) { return this.players.get(id); }
+
+        getPlayerByName(name) {
+            for (const [id, player] of this.players.entries()) {
+                if (player.name === name) return player;
+            }
+            return null;
+        }
+
+        getPlayerAtPosition(x, y) {
+            for (const [id, player] of this.players.entries()) if (player.x===x && player.y===y) return player;
+            return null;
+        }
+
+        highlightPlayerAt(x,y){
+            for(const [id,p] of this.players.entries()) p.hideAttackIndicator();
+            const target = this.getPlayerAtPosition(x,y);
+            if(target){target.showAttackIndicator(); return target;}
+            return null;
+        }
+
+        updateUIPositions() {
+            // Устаревший метод, больше не используется для анимации UI
+            for (const [id, player] of this.players.entries()) {
+                player.updateUIPosition();
+            }
+        }
+    }
+
+    /* ===== CombatSystem ===== */
+    class CombatSystem {
+        constructor(scene){this.scene=scene;this.attackCooldown=false;this.attackTimer=null;}
+
+        showAttackMenu(x,y,targetPlayer){
+            const menu=document.getElementById('attack-menu');
+            menu.style.display='block';
+            menu.style.left=(x+10)+'px';
+            menu.style.top=(y+10)+'px';
+            attackMenuVisible=true;
+            attackTarget={x:targetPlayer.x,y:targetPlayer.y,playerId:targetPlayer.id,playerName:targetPlayer.name};
+        }
+
+        attack(targetX,targetY){
+            if(this.attackCooldown) return;
+            if(stompClient && stompClient.connected){
+                stompClient.send("/app/player/attack",{},JSON.stringify({targetX,targetY}));
+                this.attackCooldown=true;
+                if(this.attackTimer) clearTimeout(this.attackTimer);
+                this.attackTimer=setTimeout(()=>this.attackCooldown=false,1000);
+            }
+        }
+
+        handleCombatEvent(combatData) {
+            console.log('Handling combat data:', combatData);
+
+            // Проверяем на успешную атаку по наличию targetName и damage
+            if (combatData.targetName && typeof combatData.damage !== 'undefined') {
+                const { attackerName, targetName, damage, remainingHP } = combatData;
+                if (attackerName === player.name) {
+                    // Ищем цель по имени среди других игроков
+                    const targetPlayer = otherPlayersManager.getPlayerByName(targetName);
+                    if (targetPlayer) {
+                        targetPlayer.takeDamage(damage, remainingHP);
+                    }
+                    this.addCombatLog(`Вы нанесли ${damage} урона ${targetName}!`);
+                } else if (targetName === player.name) {
+                    player.takeDamage(damage, remainingHP);
+                    this.addCombatLog(`${attackerName} нанес вам ${damage} урона! Осталось HP: ${remainingHP}`);
+                }
+            } else if (combatData.attackerName && combatData.attackerName === player.name) {
+                // Промах: только attackerName присутствует
+                this.addCombatLog("Атака не удалась!");
+            }
+        }
+
+        addCombatLog(message){
+            const logElement=document.getElementById('combat-log');
+            const logEntry=document.createElement('div'); logEntry.textContent=`[${new Date().toLocaleTimeString()}] ${message}`;
+            logElement.appendChild(logEntry); logElement.scrollTop=logElement.scrollHeight;
+            while(logElement.children.length>10) logElement.removeChild(logElement.firstChild);
+        }
+    }
+
+    function attackSelectedTarget(){if(attackTarget&&combatSystem) combatSystem.attack(attackTarget.x,attackTarget.y); hideAttackMenu();}
+    function hideAttackMenu(){document.getElementById('attack-menu').style.display='none';attackMenuVisible=false;attackTarget=null;for(const [id,p] of otherPlayersManager.players.entries()) p.hideAttackIndicator();}
+
+    let stompClient=null,reconnectAttempts=0,maxReconnectAttempts=10,combatSystem;
+
+    function updateStatus(message,isError=false){const status=document.getElementById('status');status.textContent=message;status.style.color=isError?'#ff6666':'#9f9';}
+
+    function initWebSocket(){
+        updateStatus('Подключение к серверу...');
+        const socket=new WebSocket("ws://localhost:8080/ws-game");
+        socket.onerror=function(e){console.error(e);updateStatus('Ошибка подключения',true);}
+        socket.onclose=function(e){
+            if(reconnectAttempts<maxReconnectAttempts){reconnectAttempts++; const delay=Math.min(3000*reconnectAttempts,10000);
+                updateStatus(`Переподключение через ${delay/1000}сек... (${reconnectAttempts}/${maxReconnectAttempts})`);
+                setTimeout(initWebSocket,delay);} else updateStatus('Не удалось подключиться',true);
+        };
+
+        stompClient=Stomp.over(socket); stompClient.debug=null;
+        stompClient.connect({},frame=>{
+            reconnectAttempts=0;
+            const userName=frame.headers['user-name'];
+            updateStatus('Подключено: '+userName);
+            if(userName && player) player.updateName(userName);
+
+            stompClient.subscribe('/user/'+userName+'/queue/events',msg=>{ try{ const pos=JSON.parse(msg.body); if(player)player.handleServerPosition(pos);}catch(e){console.error(e);} });
+            stompClient.subscribe('/user/'+userName+'/queue/visibility',msg=>{ try{ const visibilityData=JSON.parse(msg.body); if(otherPlayersManager && visibilityData.visiblePlayers) otherPlayersManager.updateVisibility(visibilityData.visiblePlayers);}catch(e){console.error(e);} });
+            stompClient.subscribe('/user/' + userName + '/queue/combat', msg => {
+                try {
+                    const combatData = JSON.parse(msg.body);
+
+                    // 🔍 Лог входящих данных
+                    console.debug('[Combat][INCOMING]', {
+                        from: 'Server',
+                        to: userName,
+                        raw: msg.body,
+                        parsed: combatData
+                    });
+
+                    if (combatSystem) {
+                        // 🔍 Лог перед обработкой
+                        console.debug('[Combat][PROCESSING]', {
+                            handler: 'combatSystem.handleCombatEvent',
+                            data: combatData
+                        });
+
+                        combatSystem.handleCombatEvent(combatData);
+
+                        // 🔍 Лог после обработки (если есть результат)
+                        console.debug('[Combat][HANDLED]', {
+                            status: 'OK',
+                            eventType: combatData?.targetName ? 'success' : 'miss'
+                        });
+                    } else {
+                        console.warn('[Combat][WARN] combatSystem is not initialized');
+                    }
+                } catch (e) {
+                    console.error('[Combat][ERROR]', {
+                        error: e,
+                        raw: msg.body
+                    });
+                }
+            });
+
+            stompClient.subscribe('/topic/player/disconnect',msg=>{ try{ const data=JSON.parse(msg.body); if(data.type==='playerDisconnect' && data.playerId) otherPlayersManager.removePlayer(data.playerId);}catch(e){console.error(e);} });
+        },err=>{console.error(err);updateStatus('Ошибка подключения',true);});
+    }
+
+    /* ===== Phaser Scene ===== */
+    let config={type:Phaser.AUTO,width:window.innerWidth,height:window.innerHeight,backgroundColor:'#0b0b0b',
+        scene:{preload(){},create:create,update:update},
+        physics:{default:'arcade'},parent:document.body
+    };
+    let game=new Phaser.Game(config);
+    let worldManager,player,otherPlayersManager;
+
+    function create(){
+        worldManager=new WorldManager(this);
+        player=new Player(this,worldManager,1,'Игрок');
+        otherPlayersManager=new OtherPlayersManager(this,worldManager);
+        combatSystem=new CombatSystem(this);
+
+        // Настройка камеры для плавного следования за персонажем
+        this.cameras.main.startFollow(player.sprite);
+        this.cameras.main.setFollowOffset(0, 0);
+        this.cameras.main.setZoom(1);
+        this.cameras.main.setDeadzone(50, 50);
+
+        initWebSocket();
+
+        this.input.on('pointerdown',pointer=>{
+            if(pointer.rightButtonDown()){
+                const tx=Math.floor(pointer.worldX/CELL_SIZE);
+                const ty=Math.floor(pointer.worldY/CELL_SIZE);
+                const targetPlayer=otherPlayersManager.highlightPlayerAt(tx,ty);
+                if(targetPlayer) combatSystem.showAttackMenu(pointer.x,pointer.y,targetPlayer);
+            } else if(pointer.leftButtonDown()){
+                const tx=Math.floor(pointer.worldX/CELL_SIZE);
+                const ty=Math.floor(pointer.worldY/CELL_SIZE);
+                player.setTarget(tx,ty);
+            }
+        });
+
+        // Полное отключение контекстного меню
+        this.input.mouse.disableContextMenu();
+        document.addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+            return false;
+        });
+    }
+
+    function update(time,delta){
+        worldManager.ensureCoveringCamera(this.cameras.main);
+        player.tryStep();
+
+        // Обновление позиций UI элементов больше не требуется, так как они анимируются вместе с персонажем
+    }
+
+    function setPosition(obj,x,y){if(obj){obj.x=x;obj.y=y;}}
+</script>
+</body>
+</html>

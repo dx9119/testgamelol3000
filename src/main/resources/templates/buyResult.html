@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="UTF-8">
+    <title>Результат покупки</title>
+</head>
+<body>
+<h2>Результат покупки оружия</h2>
+
+<div th:if="${buyResult != null}">
+    <p><strong>ID оружия:</strong> <span th:text="${buyResult.idWeapon}">[id]</span></p>
+    <p><strong>Стоимость:</strong> <span th:text="${buyResult.sellCost}">[cost]</span> Biba Coins</p>
+    <p><strong>Статус:</strong> <span th:text="${buyResult.status}">[status]</span></p>
+</div>
+
+<div th:if="${buyResult == null}">
+    <p>Нет данных о покупке.</p>
+</div>
+
+<a th:href="@{/market/?marketId=1}">Вернуться в магазин</a>
+</body>
+</html>
